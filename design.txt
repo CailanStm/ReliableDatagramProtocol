@@ -1,0 +1,108 @@
+CSC 361 P2 Design Document
+Cailan St Martin
+V00826057
+March 2017
+
+ 1. My header is a fixed-length string of ASCII characters, ending in a blank line
+	(represented by the characters \r\n\r\n). The general format is as follows:
+	
+		CSC361***#####@@@@@@\r\n\r\n
+	
+	CSC361: indicates that this is indeed valid packet
+	***: the type of the packet (SYN, ACK, FIN, DAT, RST)
+	#####: the sequence number or acknowledgement number of the packet (5 ASCII numbers)
+	@@@@@@: the window size or payload length of the packet (6 ASCII numbers)
+	\r\n\r\n: a blank line, indicating the boundary between the header fields and the payload
+
+	The numerical fields (sequence/acknowledgement and window/payload size) are encoded into ASCII,
+	and are specified in base 10 (ie, each digit is between 0 and 9 inclusive). Since it is ASCII
+	encoded, there is no reason to use a binary representation; base 10 allows for a much larger
+	range of numbers in as many characters as base 2 would. I chose base 10 rather than a larger base,
+	such as 16, for simplicity.
+	
+	The meaning of each of these fields is as described in the P2 assignment specification. The receiver
+	interprets ##### as a sequence number, while the sender interprets it as an acknowledgement number.
+	Sequence and acknowledgement numbers are byte-oriented.
+	The receiver interprets @@@@@@ as a payload length (in bytes), while the sender interprets it as
+	the receiver's available window size (in bytes). I use no additional header fields.
+	I have a module, rdp_packets, which defines the header field lengths, and provides 
+	functions for the interpretation and creation of packets.
+	
+ 2. I use a two-way handshake to establish a connection: the sender chooses an initial sequence number
+	randomly, and sends a packet of type SYN using this sequence number, with no payload, to the receiver.
+	When the receiver receives this, it responds with an ACK packet, with acknowledgement number one greater
+	than the sequence number it received. (Note that if the sequence number exceeds what can be specified
+	in the packet header, ie the value 99999, it will roll over back to zero). At this point, a connection
+	has been opened. The sender will try 5 times to send an initial SYN packet; if it does not receive an ACK 
+	for any of them, it will consider the receiver to be down, and will stop trying.
+	
+	When the sender has reached the end of the file, it will send a packet of type FIN. The receiver will
+	respond with an ACK with acknowledgement number one greater than the FIN sequence number, closing the
+	connection.
+	
+	If something goes wrong on either end (for example, a system call fails inexplicably), an RST packet will 
+	be sent. When this is received, the other side will immediately stop the connection, dropping any data
+	that was already received. This part is not yet implemented in p2a.
+	
+ 3. Flow control is handled via the window size field. Whenever the receiver receives a packet, it decrements 
+	the current window size by the length of the payload. It then immediately sends an ACK with the new
+	window size. The sender keeps track of the number of bytes that have been sent but not ACKed, as well as 
+	the most recent window size received. It stops sending data if the number of bytes sent but not ACKed is
+	within 1 MPL (Max Payload Length) of the most recent window size. (I chose not to completely fill the 
+	window size, since this could result in very small packets being sent).
+	
+	Every UDP socket has an internal buffer, whose capacity can be found using 
+	getsockopt(sock,SOL_SOCKET,SO_RCVBUF,(void *)&n, &m);
+	Since the rdpr and rdps programs only have a single process, it would be impossible to read data into 
+	an application-layer buffer while simultaneously reading from or writing to a file. So, I decided to
+	use the UDP internal socket buffer as my "buffer" at both the sender and receiver size. On the lab
+	computers, I saw that this buffer size was set to 212992 bytes. So, as long as my window size is always
+	smaller than that, this socket buffer will be sufficient for storing incoming, yet to be processed packets.
+	For p2b, I may explicitly set the socket buffer size using setsockopt. 
+	
+	With this implementation, I can freely write to the file at	the receiver side, and then use 
+	recvfrom to access the incoming buffer; similarly, I can read from the file and send packets from the
+	sender side, knowing that the UDP socket is buffering any incoming ACK packets.
+	
+	On the receiver side, every time I receive a DAT packet, I immediately send an ACK, write the payload
+	to the file, and then look for the next packet from the incoming buffer. On the sender side, any time
+	I receive an ACK that indicates a window size larger than 1 MPL, I send packets until the window size
+	is again smaller than 1 MPL, and then look for the next packet from the incoming buffer. The only time
+	a smaller packet will be sent, is at the end of the file (if there is less than 1 MPL of data left to send).
+	
+	The initial window size chosen was 10240. This allows numerous packets to be sent at once (max payload
+	size is no greater than 1024). It is also considerably smaller than the default socket buffer size of roughly
+	200000 bytes. For p2a, the window size will remain static, for implementation simplicity. For p2b, if
+	I find that transmission times are very slow, I will consider implementing a dynamic window size. The 
+	receiver would keep track of the rate at which it is receiving data, and if this becomes too slow, the
+	window size will be decreased (be cut in half); if it becomes fast, the window size will increase (double). 
+	The actual thresholds for "too slow" and "fast" will have to be determined after implementation, through 
+	experimentation.
+	
+ 4. Note that no error detection has been implemented for p2a.
+ 
+	Error (specifically, packet loss) detection will be implemented using a timeout on the sender side.
+	The protocol will implement a Go-Back-N strategy. A timer on the sender side will be started for each 
+	packet that is sent (by storing the timestamp that it was sent). If the timer expires (ie, the length of 
+	time of the timeout has passed, without receiving an ACK for that packet - this will be checked in the main 
+	loop), the sender will resend this packet as well as packets after it (based on the flow control rules).
+	
+	When the receiver receives an out-of-order packet (which will happen if some packets are lost), it will
+	respond with an ACK number for the most up-to-date packet that it received (cumulative acknowledgement).
+	
+	Go-Back-N was chosen for implementation simplicity. It will still ensure that all packets eventually
+	reach the destination, in the correct order.
+	
+	The initial timeout value will be 0.8 seconds. This was chosen as it is roughly the average round trip
+	time between the two lab computer interfaces, through the router (measured using ping 10.10.1.100).
+	I will use a simple method of adjusting this timeout value: If a timeout occurs for a packet three
+	consecutive times, the timeout value will be adjusted according to: new_timeout = old_timeout * 1.25
+	This will attempt to ensure that the timeout value is not too small, without overestimating the timeout
+	value too readily. Since the network traffic conditions will not vary wildly in our situation (ie, the 
+	actual round trip time should remain fairly constant), it should not be necessary to implement a complicated
+	timeout value calculation.
+	
+ 5. I would like to hear feedback about using the internal socket buffers as my receiver/sender buffers. This
+	seems like the most logical thing to do in our case, since it does not require additional code; would like
+	to know if there is any downside to not creating an application-layer buffer for yet-to-be-processed incoming
+	packets.
