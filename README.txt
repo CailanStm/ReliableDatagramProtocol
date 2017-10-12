@@ -1,8 +1,6 @@
 Reliable Datagram Protocol
 Developed for CSC 361 at UVic by:
 Cailan St Martin
-V00826057
-Lab section B03
 March 2017
 
 Overview:
